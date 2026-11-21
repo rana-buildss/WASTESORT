@@ -1,4 +1,6 @@
 export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+// Keep the JSON image field well below Vercel's 4.5 MB Function request limit.
+export const MAX_COMPRESSED_IMAGE_DATA_URL_BYTES = 3_500_000;
 export const ALLOWED_MIME_TYPES = [
   'image/jpeg',
   'image/jpg',
@@ -61,19 +63,37 @@ export async function compressImage(
         }
 
         const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-
         const ctx = canvas.getContext('2d');
         if (!ctx) {
-          resolve(event.target?.result as string);
+          reject(new Error('Could not prepare image for upload'));
           return;
         }
 
-        ctx.drawImage(img, 0, 0, width, height);
-        // Export as JPEG with controlled quality
-        const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
-        resolve(compressedDataUrl);
+        const qualities = [...new Set([quality, 0.68, 0.55, 0.42, 0.32])];
+        for (let resizeAttempt = 0; resizeAttempt < 12; resizeAttempt += 1) {
+          canvas.width = width;
+          canvas.height = height;
+          ctx.clearRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+
+          for (const outputQuality of qualities) {
+            const compressedDataUrl = canvas.toDataURL('image/jpeg', outputQuality);
+            // Data URLs contain only ASCII characters, so length equals their UTF-8 byte size.
+            if (compressedDataUrl.length <= MAX_COMPRESSED_IMAGE_DATA_URL_BYTES) {
+              resolve(compressedDataUrl);
+              return;
+            }
+          }
+
+          if (Math.max(width, height) <= 256) break;
+          const scale = Math.max(0.55, Math.min(0.82, Math.sqrt(
+            MAX_COMPRESSED_IMAGE_DATA_URL_BYTES / canvas.toDataURL('image/jpeg', qualities[qualities.length - 1]).length
+          ) * 0.9));
+          width = Math.max(1, Math.floor(width * scale));
+          height = Math.max(1, Math.floor(height * scale));
+        }
+
+        reject(new Error('Could not compress this image small enough to upload. Please choose a smaller image.'));
       };
       img.onerror = () => reject(new Error('Failed to load image for compression'));
       img.src = event.target?.result as string;

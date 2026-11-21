@@ -2,6 +2,9 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { SERVER_WASTE_RULES } from './wasteRulesData';
 import { SERVER_COLLECTION_POINTS } from './collectionPointsData';
 
@@ -9,15 +12,45 @@ import { SERVER_COLLECTION_POINTS } from './collectionPointsData';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const MAX_IMAGE_DATA_URL_BYTES = 3_500_000;
+const MAX_JSON_BODY_BYTES = 4 * 1024 * 1024;
 
 // Server middleware
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '4mb' }));
 
 // In-memory feedback and corrections store for runtime persistence
 const inMemoryFeedback: any[] = [];
 const inMemoryCorrections: any[] = [];
+
+function getSupabaseClient() {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+  const key = process.env.SUPABASE_PUBLISHABLE_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY || '';
+  return url && key ? createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  }) : null;
+}
+
+async function insertUserFeedback(row: {
+  feedback_type: string;
+  related_item: string | null;
+  suggested_category: string | null;
+  description: string;
+  email: string | null;
+}): Promise<boolean> {
+  const client = getSupabaseClient();
+  if (!client) return false;
+  try {
+    const { error } = await client.from('user_feedback').insert(row);
+    if (!error) return true;
+    console.warn('Supabase user_feedback insert failed:', error.code || 'database error');
+  } catch {
+    console.warn('Supabase user_feedback insert failed: request error');
+  }
+  return false;
+}
 
 // Gemini model candidate priority
 const GEMINI_MODELS = [
@@ -74,8 +107,13 @@ If the image is ambiguous, blurry, or does not clearly show waste, return:
 app.post('/api/identify-waste', async (req: Request, res: Response): Promise<void> => {
   try {
     const { image, locality } = req.body;
-    if (!image) {
+    if (typeof image !== 'string' || !image) {
       res.status(400).json({ error: 'Missing image payload' });
+      return;
+    }
+    if (Buffer.byteLength(JSON.stringify(req.body), 'utf8') > MAX_JSON_BODY_BYTES ||
+        Buffer.byteLength(image, 'utf8') > MAX_IMAGE_DATA_URL_BYTES) {
+      res.status(413).json({ error: 'Compressed image is too large. Please choose another image.' });
       return;
     }
 
@@ -132,7 +170,7 @@ app.post('/api/identify-waste', async (req: Request, res: Response): Promise<voi
           console.log(`[AI Success] Identified: "${result.item_name}" (${result.category}, confidence: ${result.confidence}) using ${modelName}`);
           break; // Model succeeded!
         } catch (geminiError: any) {
-          console.warn(`[AI Warning] Model ${modelName} failed: ${geminiError.message}. Trying next candidate...`);
+          console.warn(`[AI Warning] Model ${modelName} failed. Trying next candidate...`);
         }
       }
     }
@@ -236,32 +274,84 @@ app.get('/api/collection-points', (req: Request, res: Response) => {
 /**
  * POST /api/feedback
  */
-app.post('/api/feedback', (req: Request, res: Response) => {
-  const feedback = {
-    id: `fb-${Date.now()}`,
-    ...req.body,
-    created_at: new Date().toISOString(),
+app.post('/api/feedback', async (req: Request, res: Response): Promise<void> => {
+  const { feedback_type, related_item, suggested_category, description, email } = req.body || {};
+  if (typeof feedback_type !== 'string' || typeof description !== 'string' || !description.trim()) {
+    res.status(400).json({ success: false, error: 'Feedback type and description are required.' });
+    return;
+  }
+  const row = {
+    feedback_type,
+    related_item: typeof related_item === 'string' ? related_item : null,
+    suggested_category: typeof suggested_category === 'string' ? suggested_category : null,
+    description,
+    email: typeof email === 'string' ? email : null,
   };
+  if (await insertUserFeedback(row)) {
+    res.json({ success: true, persisted: true, message: 'Feedback saved to Supabase.' });
+    return;
+  }
+  const feedback = { id: `fb-${Date.now()}`, ...row, created_at: new Date().toISOString() };
   inMemoryFeedback.push(feedback);
-  console.log('[Feedback Received]:', feedback);
-  res.json({ success: true, message: 'Feedback recorded successfully', id: feedback.id });
+  res.json({ success: true, persisted: false, message: 'Feedback received temporarily; database storage is unavailable.' });
 });
 
 /**
  * POST /api/correct-classification
  */
-app.post('/api/correct-classification', (req: Request, res: Response) => {
+app.post('/api/correct-classification', async (req: Request, res: Response): Promise<void> => {
+  const { scan_id, original_item, original_category, corrected_category, explanation } = req.body || {};
+  if (typeof original_item !== 'string' || !original_item.trim() ||
+      typeof original_category !== 'string' || typeof corrected_category !== 'string') {
+    res.status(400).json({ success: false, error: 'Item, original category, and corrected category are required.' });
+    return;
+  }
+  const description = [
+    `Classification correction: ${original_category} → ${corrected_category}.`,
+    scan_id ? `Scan ID: ${String(scan_id).slice(0, 100)}.` : '',
+    typeof explanation === 'string' && explanation.trim() ? `Explanation: ${explanation.trim()}` : '',
+  ].filter(Boolean).join(' ');
+  const row = {
+    feedback_type: 'incorrect_classification',
+    related_item: original_item,
+    suggested_category: corrected_category,
+    description,
+    email: null,
+  };
+  if (await insertUserFeedback(row)) {
+    res.json({ success: true, persisted: true, message: 'Correction saved to Supabase.' });
+    return;
+  }
   const correction = {
     id: `corr-${Date.now()}`,
-    ...req.body,
+    scan_id,
+    original_item,
+    original_category,
+    corrected_category,
+    explanation,
     created_at: new Date().toISOString(),
   };
   inMemoryCorrections.push(correction);
-  console.log('[Classification Correction Logged]:', correction);
-  res.json({ success: true, message: 'Correction noted and stored', id: correction.id });
+  res.json({ success: true, persisted: false, message: 'Correction received temporarily; database storage is unavailable.' });
 });
 
-// Start listening
-app.listen(PORT, () => {
-  console.log(`[WasteSort Server] Running on http://localhost:${PORT}`);
+// Keep oversized/invalid JSON responses explicit for local and Vercel requests.
+app.use((error: any, _req: Request, res: Response, _next: any) => {
+  if (error?.type === 'entity.too.large') {
+    res.status(413).json({ error: 'Request payload is too large.' });
+    return;
+  }
+  console.error('API request failed:', error?.status || 'internal error');
+  res.status(error?.status || 500).json({ error: 'Request could not be processed.' });
 });
+
+export default app;
+
+// The same module is imported by Vercel's function adapter. Only open a local
+// listener when invoked directly by the existing `npm run server` command.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`[WasteSort Server] Running on http://localhost:${PORT}`);
+  });
+}

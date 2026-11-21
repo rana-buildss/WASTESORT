@@ -29,8 +29,12 @@ export async function submitUserFeedback(feedback: UserFeedback): Promise<{ succ
     });
 
     if (response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (result.persisted === true) {
+        return { success: true, message: 'Thank you! Your feedback was saved to the database.' };
+      }
       saveFeedbackLocally(feedback);
-      return { success: true, message: 'Supabase is unavailable; feedback was received by the server but may not persist after restart.' };
+      return { success: true, message: 'Database storage is unavailable; feedback was saved on this device.' };
     }
   } catch (e) {
     console.warn('API feedback endpoint offline, checking Supabase direct insert:', e);
@@ -58,7 +62,7 @@ function saveFeedbackLocally(feedback: UserFeedback) {
 
 export async function submitClassificationCorrection(
   correction: ClassificationCorrection
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; persisted: boolean; message: string }> {
   try {
     const response = await fetch('/api/correct-classification', {
       method: 'POST',
@@ -67,14 +71,36 @@ export async function submitClassificationCorrection(
     });
 
     if (response.ok) {
-      return { success: true, message: 'Correction noted! Our model training log has been updated.' };
+      const result = await response.json().catch(() => ({}));
+      if (result.persisted === true) {
+        return { success: true, persisted: true, message: 'Correction saved to the database.' };
+      }
     }
   } catch (e) {
-    console.warn('API correction endpoint error, saving locally:', e);
+    console.warn('API correction endpoint unavailable; saving on this device:', e);
   }
 
+  const locallySaved = saveCorrectionLocally(correction);
   return {
-    success: true,
-    message: 'Correction noted! Thank you for helping improve WasteSort accuracy.',
+    success: locallySaved,
+    persisted: false,
+    message: locallySaved
+      ? 'Database storage is unavailable; this correction was saved on this device.'
+      : 'The correction could not be saved. Please try again.',
   };
+}
+
+function saveCorrectionLocally(correction: ClassificationCorrection): boolean {
+  try {
+    const key = 'wastesort_pending_corrections';
+    const current = JSON.parse(localStorage.getItem(key) || '[]');
+    localStorage.setItem(key, JSON.stringify([
+      ...current,
+      { ...correction, id: `local-${Date.now()}`, created_at: new Date().toISOString() },
+    ].slice(-100)));
+    return true;
+  } catch (error) {
+    console.warn('Could not save correction on this device:', error);
+    return false;
+  }
 }

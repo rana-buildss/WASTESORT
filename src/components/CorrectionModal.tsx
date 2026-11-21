@@ -35,30 +35,41 @@ export default function CorrectionModal({
   const [explanation, setExplanation] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const [submittedMessage, setSubmittedMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
 
   if (!isOpen) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
+    setErrorMessage('');
 
     try {
-      await submitClassificationCorrection({
+      const result = await submitClassificationCorrection({
         original_item: originalItem,
         original_category: originalCategory,
         corrected_category: selectedCategory,
         explanation,
       });
 
+      if (!result.success) {
+        setErrorMessage(result.message);
+        return;
+      }
+
+      setSubmittedMessage(result.message);
       setSubmitted(true);
       setTimeout(() => {
         onCorrectionApplied(selectedCategory);
         onClose();
         setSubmitted(false);
+        setSubmittedMessage('');
         setExplanation('');
       }, 1400);
     } catch (err) {
       console.error(err);
+      setErrorMessage('Could not save this correction. Please try again.');
     } finally {
       setIsSubmitting(false);
     }
@@ -93,11 +104,12 @@ export default function CorrectionModal({
             </div>
             <h4 className="text-lg font-bold text-charcoal">Correction Logged!</h4>
             <p className="text-xs text-subtext">
-              Thank you! Your feedback updates our validation rules and model fine-tuning database.
+              {submittedMessage}
             </p>
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="p-6 space-y-4">
+            {errorMessage && <p role="alert" className="text-sm text-red-700">{errorMessage}</p>}
             <div>
               <label className="block text-xs font-bold uppercase tracking-wider text-subtext mb-1">
                 Current Identification
