@@ -22,6 +22,31 @@ app.use(express.json({ limit: '4mb' }));
 // In-memory feedback and corrections store for runtime persistence
 const inMemoryFeedback: any[] = [];
 const inMemoryCorrections: any[] = [];
+const SAFE_ERROR_NAMES = new Set([
+  'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError',
+  'GoogleGenerativeAIError', 'GoogleGenerativeAIResponseError', 'PostgrestError',
+]);
+const SAFE_ERROR_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET',
+  'PGRST116', 'PGRST205', '23503', '23505', '40001',
+]);
+
+function logSafeServerError(context: string, error: unknown) {
+  const candidate = error as { name?: unknown; code?: unknown; status?: unknown } | null;
+  console.error(`[WasteSort] ${context}`, {
+    name: typeof candidate?.name === 'string' && SAFE_ERROR_NAMES.has(candidate.name)
+      ? candidate.name
+      : 'OtherError',
+    code: typeof candidate?.code === 'string' && SAFE_ERROR_CODES.has(candidate.code)
+      ? candidate.code
+      : 'Other',
+    status: typeof candidate?.status === 'number' && Number.isInteger(candidate.status) &&
+      candidate.status >= 400 && candidate.status <= 599
+      ? candidate.status
+      : undefined,
+  });
+}
 
 function getSupabaseClient() {
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
@@ -170,7 +195,7 @@ app.post('/api/identify-waste', async (req: Request, res: Response): Promise<voi
           console.log(`[AI Success] Identified: "${result.item_name}" (${result.category}, confidence: ${result.confidence}) using ${modelName}`);
           break; // Model succeeded!
         } catch (geminiError: any) {
-          console.warn(`[AI Warning] Model ${modelName} failed. Trying next candidate...`);
+          logSafeServerError(`Gemini model ${modelName} request failed`, geminiError);
         }
       }
     }
@@ -236,8 +261,8 @@ app.post('/api/identify-waste', async (req: Request, res: Response): Promise<voi
 
     res.json(result);
   } catch (error: any) {
-    console.error('API Error /api/identify-waste:', error);
-    res.status(500).json({ error: error.message || 'Failed to identify waste' });
+    logSafeServerError('/api/identify-waste failed', error);
+    res.status(500).json({ error: 'Waste identification failed. Please try again.' });
   }
 });
 
